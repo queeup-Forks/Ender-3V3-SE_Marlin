@@ -383,6 +383,16 @@ class Stepper {
 
   public:
 
+    // The minimal step rate ensures calculations stay within limits
+    // and avoid the most unreasonably slow step rates.
+    static constexpr uint32_t minimal_step_rate = (
+      #ifdef CPU_32_BIT
+        _MAX((STEPPER_TIMER_RATE) / HAL_TIMER_TYPE_MAX, 1U) // 32-bit shouldn't go below 1
+      #else
+        (F_CPU) / 500000U   // AVR shouldn't go below 32 (16MHz) or 40 (20MHz)
+      #endif
+    );
+
     #if EITHER(HAS_EXTRA_ENDSTOPS, Z_STEPPER_AUTO_ALIGN)
       static bool separate_multi_axis;
     #endif
@@ -484,23 +494,24 @@ class Stepper {
     #endif
 
     #if ENABLED(LIN_ADVANCE)
-      static constexpr uint32_t LA_ADV_NEVER = 0xFFFFFFFF;
-      static uint32_t nextAdvanceISR, LA_isr_rate;
-      static uint16_t LA_current_adv_steps, LA_final_adv_steps, LA_max_adv_steps; // Copy from current executed block. Needed because current_block is set to NULL "too early".
-      static int8_t LA_steps;
-      static bool LA_use_advance_lead;
+      static constexpr hal_timer_t LA_ADV_NEVER = HAL_TIMER_TYPE_MAX;
+      static hal_timer_t nextAdvanceISR,
+                         la_interval;      // Interval between ISR calls for LA
+      static int32_t     la_delta_error,   // Analogue of delta_error.e for E steps in LA ISR
+                         la_dividend,      // Analogue of advance_dividend.e for E steps in LA ISR
+                         la_advance_steps; // Count of steps added to increase nozzle pressure
     #endif
 
     #if ENABLED(INTEGRATED_BABYSTEPPING)
-      static constexpr uint32_t BABYSTEP_NEVER = 0xFFFFFFFF;
-      static uint32_t nextBabystepISR;
+      static constexpr hal_timer_t BABYSTEP_NEVER = HAL_TIMER_TYPE_MAX;
+      static hal_timer_t nextBabystepISR;
     #endif
 
     #if ENABLED(DIRECT_STEPPING)
       static page_step_state_t page_step_state;
     #endif
 
-    static int32_t ticks_nominal;
+    static hal_timer_t ticks_nominal;
     #if DISABLED(S_CURVE_ACCELERATION)
       static uint32_t acc_step_rate; // needed for deceleration start point
     #endif
@@ -558,7 +569,7 @@ class Stepper {
     static void pulse_phase_isr();
 
     // The stepper block processing ISR phase
-    static uint32_t block_phase_isr();
+    static hal_timer_t block_phase_isr();
 
     #if HAS_SHAPING
       static void shaping_isr();
@@ -566,13 +577,12 @@ class Stepper {
 
     #if ENABLED(LIN_ADVANCE)
       // The Linear advance ISR phase
-      static uint32_t advance_isr();
-      FORCE_INLINE static void initiateLA() { nextAdvanceISR = 0; }
+      static void advance_isr();
     #endif
 
     #if ENABLED(INTEGRATED_BABYSTEPPING)
       // The Babystepping ISR phase
-      static uint32_t babystepping_isr();
+      static hal_timer_t babystepping_isr();
       FORCE_INLINE static void initiateBabystepping() {
         if (nextBabystepISR == BABYSTEP_NEVER) {
           nextBabystepISR = 0;
@@ -619,6 +629,7 @@ class Stepper {
       current_block = nullptr;
       axis_did_move = 0;
       planner.release_current_block();
+      TERN_(LIN_ADVANCE, la_interval = nextAdvanceISR = LA_ADV_NEVER);
     }
 
     // Quickly stop all steppers
@@ -709,65 +720,9 @@ class Stepper {
     static void _set_position(const int32_t &a, const int32_t &b, const int32_t &c, const int32_t &e);
     FORCE_INLINE static void _set_position(const abce_long_t &spos) { _set_position(spos.a, spos.b, spos.c, spos.e); }
 
-    FORCE_INLINE static uint32_t calc_timer_interval(uint32_t step_rate, uint8_t *loops) {
-      uint32_t timer;
-
-      // Scale the frequency, as requested by the caller
-      step_rate <<= oversampling_factor;
-
-      uint8_t multistep = 1;
-      #if DISABLED(DISABLE_MULTI_STEPPING)
-
-        // The stepping frequency limits for each multistepping rate
-        static const uint32_t limit[] PROGMEM = {
-          (  MAX_STEP_ISR_FREQUENCY_1X     ),
-          (  MAX_STEP_ISR_FREQUENCY_2X >> 1),
-          (  MAX_STEP_ISR_FREQUENCY_4X >> 2),
-          (  MAX_STEP_ISR_FREQUENCY_8X >> 3),
-          ( MAX_STEP_ISR_FREQUENCY_16X >> 4),
-          ( MAX_STEP_ISR_FREQUENCY_32X >> 5),
-          ( MAX_STEP_ISR_FREQUENCY_64X >> 6),
-          (MAX_STEP_ISR_FREQUENCY_128X >> 7)
-        };
-
-        // Select the proper multistepping
-        uint8_t idx = 0;
-        while (idx < 7 && step_rate > (uint32_t)pgm_read_dword(&limit[idx])) {
-          step_rate >>= 1;
-          multistep <<= 1;
-          ++idx;
-        };
-      #else
-        NOMORE(step_rate, uint32_t(MAX_STEP_ISR_FREQUENCY_1X));
-      #endif
-      *loops = multistep;
-
-      #ifdef CPU_32_BIT
-        // In case of high-performance processor, it is able to calculate in real-time
-        timer = uint32_t(STEPPER_TIMER_RATE) / step_rate;
-      #else
-        constexpr uint32_t min_step_rate = (F_CPU) / 500000U;
-        NOLESS(step_rate, min_step_rate);
-        step_rate -= min_step_rate; // Correct for minimal speed
-        if (step_rate >= (8 * 256)) { // higher step rate
-          const uint8_t tmp_step_rate = (step_rate & 0x00FF);
-          const uint16_t table_address = (uint16_t)&speed_lookuptable_fast[(uint8_t)(step_rate >> 8)][0],
-                         gain = (uint16_t)pgm_read_word(table_address + 2);
-          timer = MultiU16X8toH16(tmp_step_rate, gain);
-          timer = (uint16_t)pgm_read_word(table_address) - timer;
-        }
-        else { // lower step rates
-          uint16_t table_address = (uint16_t)&speed_lookuptable_slow[0][0];
-          table_address += ((step_rate) >> 1) & 0xFFFC;
-          timer = (uint16_t)pgm_read_word(table_address)
-                - (((uint16_t)pgm_read_word(table_address + 2) * (uint8_t)(step_rate & 0x0007)) >> 3);
-        }
-        // (there is no need to limit the timer value here. All limits have been
-        // applied above, and AVR is able to keep up at 30khz Stepping ISR rate)
-      #endif
-
-      return timer;
-    }
+    // Calculate timing interval for the given step rate
+    static hal_timer_t calc_timer_interval(uint32_t step_rate);
+    static hal_timer_t calc_timer_interval(uint32_t step_rate, uint8_t &loops);
 
     #if ENABLED(S_CURVE_ACCELERATION)
       static void _calc_bezier_curve_coeffs(const int32_t v0, const int32_t v1, const uint32_t av);
