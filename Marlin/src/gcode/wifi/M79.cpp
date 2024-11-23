@@ -62,7 +62,7 @@ void GcodeSuite::M79()
             // Cloud printing start flag bit
             HMI_flag.cloud_printing_flag=true;
             // Enable automatic compensation function rock_2021.10.29
-            process_subcommands_now_P(PSTR("M420 S1 Z10"));
+            process_subcommands_now_P(PSTR("M420 S1"));
           }
         #endif
         break;

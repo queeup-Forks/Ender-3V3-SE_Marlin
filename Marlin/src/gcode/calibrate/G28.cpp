@@ -485,7 +485,7 @@ void GcodeSuite::G28()
   report_current_position();
 
   // Enable automatic compensation function rock_2021.07.17
-  process_subcommands_now_P(PSTR("M420 S1 Z10"));
+  process_subcommands_now_P(PSTR("M420 S1"));
 
   if (ENABLED(NANODLP_Z_SYNC) && (doZ || ENABLED(NANODLP_ALL_AXIS)))
     SERIAL_ECHOLNPGM(STR_Z_MOVE_COMP);
